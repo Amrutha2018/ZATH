@@ -19,5 +19,18 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: always
 
+  zathapi:
+    build:
+      context: ./zath_api
+    container_name: zath-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./zath_api:/app
+    restart: always
+
 volumes:
   postgres_data:

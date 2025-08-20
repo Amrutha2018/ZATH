@@ -1,0 +1,23 @@
+services:
+  redis:
+    image: redis:7
+    container_name: zath-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  postgres:
+    image: postgres:15
+    container_name: zath-postgres
+    environment:
+      POSTGRES_DB: zathdb
+      POSTGRES_USER: zathuser
+      POSTGRES_PASSWORD: zathpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+volumes:
+  postgres_data:

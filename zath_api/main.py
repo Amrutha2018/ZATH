@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from db.connection import init_db_pool, close_db_pool
 from auth.middleware import verify_api_key
 from auth.routes import router as auth_router
+from api.routes import api_router
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -37,6 +38,9 @@ app.add_middleware(AuthMiddleware)
 
 # Include auth routes
 app.include_router(auth_router)
+
+# Include all API routes
+app.include_router(api_router)
 
 @app.get("/")
 async def read_root():

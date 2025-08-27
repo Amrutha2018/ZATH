@@ -2,12 +2,16 @@
 
 import asyncpg
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env.local if it exists
+load_dotenv('.env.local')
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "zathdb")
-DB_USER = os.getenv("DB_USER", "zathuser")
-DB_PASS = os.getenv("DB_PASS", "zathpass")
+DB_USER = os.getenv("DB_USER", "amruthae")
+DB_PASS = os.getenv("DB_PASS", "")
 
 _connection_pool = None
 

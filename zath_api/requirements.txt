@@ -1,3 +1,9 @@
 fastapi
 uvicorn
 asyncpg
+pydantic[email]
+python-multipart
+python-dotenv
+pytest
+pytest-asyncio
+aiohttp

@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 import aiohttp
@@ -130,7 +130,11 @@ class JobWorker:
             
             # Send callback if URL provided
             if callback_url:
-                await self._send_callback(callback_url, job_id, "completed")
+                callback_success = await self._send_callback(callback_url, job_id, "completed")
+                if not callback_success:
+                    logger.warning(f"Job {job_id} completed but callback failed after all retries")
+                else:
+                    logger.info(f"Job {job_id} completed and callback sent successfully")
             
             logger.info(f"Job {job_id} completed successfully")
             return True
@@ -144,7 +148,11 @@ class JobWorker:
                 
                 # Send failure callback if URL provided
                 if callback_url:
-                    await self._send_callback(callback_url, job_id, "failed", str(e))
+                    callback_success = await self._send_callback(callback_url, job_id, "failed", str(e))
+                    if not callback_success:
+                        logger.warning(f"Job {job_id} failed and callback also failed after all retries")
+                    else:
+                        logger.info(f"Job {job_id} failed but callback sent successfully")
                     
             except Exception as update_error:
                 logger.error(f"Failed to update job {job_id} status: {str(update_error)}")
@@ -179,9 +187,41 @@ class JobWorker:
             logger.error(f"Failed to update job {job_id} status: {str(e)}")
             raise
     
+    async def _update_callback_retry_count(self, job_id: str, retry_count: int):
+        """
+        Update callback retry count in the database.
+        
+        Args:
+            job_id: Unique job identifier
+            retry_count: Number of retry attempts made
+        """
+        try:
+            if not self.db_pool:
+                logger.warning("Database pool not available, attempting to reconnect")
+                await init_db_pool()
+                self.db_pool = await get_pool()
+            
+            logger.info(f"Updating callback retry count for job {job_id} to {retry_count}")
+            
+            async with self.db_pool.acquire() as conn:
+                result = await conn.execute(
+                    "UPDATE jobs SET callback_retry_count = $1, updated_at = NOW() WHERE id = $2",
+                    retry_count, job_id
+                )
+                
+                # Check if the update actually affected a row
+                if result == "UPDATE 0":
+                    logger.warning(f"No job found with ID {job_id} for callback retry count update")
+                else:
+                    logger.info(f"Successfully updated callback retry count for job {job_id} to {retry_count}")
+            
+        except Exception as e:
+            logger.error(f"Failed to update callback retry count for job {job_id}: {str(e)}")
+            # Don't raise here as this is not critical for job processing
+    
     async def _send_callback(self, callback_url: str, job_id: str, status: str, error: str = None):
         """
-        Send callback to webhook URL.
+        Send callback to webhook URL with retry logic.
         
         Args:
             callback_url: Webhook URL to send callback to
@@ -189,25 +229,59 @@ class JobWorker:
             status: Job status
             error: Error message (if any)
         """
-        try:
-            if not self.session:
-                logger.warning("HTTP session not available, creating new session")
-                self.session = aiohttp.ClientSession()
-            
-            callback_data = {
-                "job_id": job_id,
-                "status": status,
-                "completed_at": datetime.utcnow().isoformat()
-            }
-            
-            if error:
-                callback_data["error"] = error
-            
-            async with self.session.post(callback_url, json=callback_data) as response:
-                logger.info(f"Callback sent to {callback_url}, status: {response.status}")
+        max_retries = 3
+        retry_delays = [1, 5, 15]  # Exponential backoff: 1s, 5s, 15s
+        
+        callback_data = {
+            "job_id": job_id,
+            "status": status,
+            "completed_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if error:
+            callback_data["error"] = error
+        
+        for attempt in range(max_retries + 1):  # 0, 1, 2, 3 (4 attempts total)
+            try:
+                if not self.session:
+                    logger.warning("HTTP session not available, creating new session")
+                    self.session = aiohttp.ClientSession()
                 
-        except Exception as e:
-            logger.error(f"Failed to send callback to {callback_url}: {str(e)}")
+                logger.info(f"Attempting callback to {callback_url} (attempt {attempt + 1}/{max_retries + 1})")
+                
+                async with self.session.post(callback_url, json=callback_data) as response:
+                    if response.status >= 200 and response.status < 300:
+                        logger.info(f"Callback sent successfully to {callback_url}, status: {response.status}")
+                        # Update retry count to 0 on success
+                        await self._update_callback_retry_count(job_id, 0)
+                        return True
+                    else:
+                        error_msg = f"HTTP {response.status} response from {callback_url}"
+                        logger.warning(f"Callback attempt {attempt + 1} failed: {error_msg}")
+                        
+                        if attempt < max_retries:
+                            delay = retry_delays[attempt]
+                            logger.info(f"Retrying callback in {delay} seconds...")
+                            await asyncio.sleep(delay)
+                        else:
+                            logger.error(f"All callback attempts failed for job {job_id}. Final error: {error_msg}")
+                            await self._update_callback_retry_count(job_id, max_retries + 1)
+                            return False
+                            
+            except Exception as e:
+                error_msg = f"Connection error: {str(e)}"
+                logger.warning(f"Callback attempt {attempt + 1} failed: {error_msg}")
+                
+                if attempt < max_retries:
+                    delay = retry_delays[attempt]
+                    logger.info(f"Retrying callback in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"All callback attempts failed for job {job_id}. Final error: {error_msg}")
+                    await self._update_callback_retry_count(job_id, max_retries + 1)
+                    return False
+        
+        return False
     
     async def _process_queue(self):
         """Main queue processing loop."""

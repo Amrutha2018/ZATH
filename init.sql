@@ -6,6 +6,7 @@ payload JSONB,
 callback_url TEXT,
 status VARCHAR(20) NOT NULL DEFAULT 'queued',
 retry_count INT NOT NULL DEFAULT 0,
+callback_retry_count INT NOT NULL DEFAULT 0,
 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
 updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );

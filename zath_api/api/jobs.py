@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 import asyncpg
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from db.connection import get_pool
 from config.redis import get_redis_client
 
@@ -76,7 +76,8 @@ class JobStatusResponse(BaseModel):
         callback_url: Webhook URL for notifications (if provided)
         created_at: ISO timestamp when job was created
         updated_at: ISO timestamp when job was last updated
-        retry_count: Number of retry attempts made
+        retry_count: Number of job retry attempts made
+        callback_retry_count: Number of callback retry attempts made
     """
     job_id: str = Field(..., description="Unique identifier for the job (UUID)")
     task_type: str = Field(..., description="Type of job being executed")
@@ -85,7 +86,8 @@ class JobStatusResponse(BaseModel):
     callback_url: Optional[str] = Field(None, description="Webhook URL for notifications")
     created_at: str = Field(..., description="ISO timestamp when job was created")
     updated_at: Optional[str] = Field(None, description="ISO timestamp when job was last updated")
-    retry_count: int = Field(..., description="Number of retry attempts made")
+    retry_count: int = Field(..., description="Number of job retry attempts made")
+    callback_retry_count: int = Field(..., description="Number of callback retry attempts made")
 
 # Database Operations (self-contained)
 async def create_job_in_db(task_type: str, payload: dict, callback_url: str = None) -> str:
@@ -117,7 +119,7 @@ async def get_job_by_id(job_id: str) -> Optional[Dict[str, Any]]:
         job = await conn.fetchrow(
             """
             SELECT id, task_type, payload, callback_url, status, 
-                   retry_count, created_at, updated_at
+                   retry_count, callback_retry_count, created_at, updated_at
             FROM jobs 
             WHERE id = $1
             """,
@@ -140,6 +142,7 @@ async def get_job_by_id(job_id: str) -> Optional[Dict[str, Any]]:
                 "callback_url": job['callback_url'],
                 "status": job['status'],
                 "retry_count": job['retry_count'],
+                "callback_retry_count": job['callback_retry_count'],
                 "created_at": job['created_at'].isoformat() if job['created_at'] else None,
                 "updated_at": job['updated_at'].isoformat() if job['updated_at'] else None
             }
@@ -261,7 +264,7 @@ async def create_job(job_data: JobCreate, request: Request):
                 "task_type": job_data.task_type,
                 "payload": job_data.payload,
                 "callback_url": str(job_data.callback_url) if job_data.callback_url else None,
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
             
             redis_client = await get_redis_client()
@@ -275,7 +278,7 @@ async def create_job(job_data: JobCreate, request: Request):
         return JobResponse(
             job_id=job_id,
             status="queued",
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.now(timezone.utc).isoformat()
         )
         
     except asyncpg.UniqueViolationError:
@@ -316,7 +319,8 @@ async def get_job_status(job_id: str, request: Request):
     - **callback_url** (string, optional): Webhook URL for notifications
     - **created_at** (string): ISO timestamp when job was created
     - **updated_at** (string, optional): ISO timestamp when job was last updated
-    - **retry_count** (integer): Number of retry attempts made
+    - **retry_count** (integer): Number of job retry attempts made
+    - **callback_retry_count** (integer): Number of callback retry attempts made
     
     ## Authentication
     
@@ -346,7 +350,8 @@ async def get_job_status(job_id: str, request: Request):
       "callback_url": "https://webhook.site/abc123",
       "created_at": "2024-01-15T10:30:00Z",
       "updated_at": "2024-01-15T10:30:05Z",
-      "retry_count": 0
+      "retry_count": 0,
+      "callback_retry_count": 0
     }
     ```
     
@@ -368,7 +373,8 @@ async def get_job_status(job_id: str, request: Request):
     
     - Job payload is returned as-is from the database
     - Timestamps are in ISO 8601 format with timezone information
-    - Retry count shows how many times the job has been retried
+    - Job retry count shows how many times the job has been retried
+    - Callback retry count shows how many times callback delivery was attempted
     - Updated timestamp is only present if the job has been modified
     """
     try:

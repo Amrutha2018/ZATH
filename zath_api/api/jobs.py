@@ -7,11 +7,29 @@ from pydantic import BaseModel, HttpUrl, validator, Field
 from typing import Dict, Any, Optional
 import asyncpg
 import json
+import uuid
 from datetime import datetime
 from db.connection import get_pool
 from config.redis import get_redis_client
 
 router = APIRouter(tags=["Jobs"])
+
+# Utility Functions
+def validate_uuid(uuid_string: str) -> bool:
+    """
+    Validate if a string is a valid UUID format.
+    
+    Args:
+        uuid_string: String to validate
+        
+    Returns:
+        True if valid UUID, False otherwise
+    """
+    try:
+        uuid.UUID(uuid_string)
+        return True
+    except ValueError:
+        return False
 
 # Data Models
 class JobCreate(BaseModel):
@@ -46,6 +64,29 @@ class JobResponse(BaseModel):
     status: str = Field(..., description="Current job status (always 'queued' initially)")
     created_at: str = Field(..., description="ISO timestamp when job was created")
 
+class JobStatusResponse(BaseModel):
+    """
+    Response model for job status retrieval.
+    
+    Attributes:
+        job_id: Unique identifier for the job (UUID)
+        task_type: Type of job being executed
+        status: Current job status (queued, in_progress, completed, failed)
+        payload: Job payload data (if accessible)
+        callback_url: Webhook URL for notifications (if provided)
+        created_at: ISO timestamp when job was created
+        updated_at: ISO timestamp when job was last updated
+        retry_count: Number of retry attempts made
+    """
+    job_id: str = Field(..., description="Unique identifier for the job (UUID)")
+    task_type: str = Field(..., description="Type of job being executed")
+    status: str = Field(..., description="Current job status (queued, in_progress, completed, failed)")
+    payload: Optional[Dict[str, Any]] = Field(None, description="Job payload data")
+    callback_url: Optional[str] = Field(None, description="Webhook URL for notifications")
+    created_at: str = Field(..., description="ISO timestamp when job was created")
+    updated_at: Optional[str] = Field(None, description="ISO timestamp when job was last updated")
+    retry_count: int = Field(..., description="Number of retry attempts made")
+
 # Database Operations (self-contained)
 async def create_job_in_db(task_type: str, payload: dict, callback_url: str = None) -> str:
     """Create a new job in the database and return job_id"""
@@ -60,6 +101,49 @@ async def create_job_in_db(task_type: str, payload: dict, callback_url: str = No
             task_type, json.dumps(payload), str(callback_url) if callback_url else None
         )
         return str(job_id)
+
+async def get_job_by_id(job_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a job by its ID from the database.
+    
+    Args:
+        job_id: The UUID of the job to retrieve
+        
+    Returns:
+        Job data as dictionary or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job = await conn.fetchrow(
+            """
+            SELECT id, task_type, payload, callback_url, status, 
+                   retry_count, created_at, updated_at
+            FROM jobs 
+            WHERE id = $1
+            """,
+            job_id
+        )
+        
+        if job:
+            # Handle payload - it might be stored as JSONB (dict) or as string
+            payload = job['payload']
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    payload = None
+            
+            return {
+                "job_id": str(job['id']),  # Changed from 'id' to 'job_id'
+                "task_type": job['task_type'],
+                "payload": payload,
+                "callback_url": job['callback_url'],
+                "status": job['status'],
+                "retry_count": job['retry_count'],
+                "created_at": job['created_at'].isoformat() if job['created_at'] else None,
+                "updated_at": job['updated_at'].isoformat() if job['updated_at'] else None
+            }
+        return None
 
 # API Endpoint
 @router.post("/jobs", response_model=JobResponse, status_code=202)
@@ -203,4 +287,117 @@ async def create_job(job_data: JobCreate, request: Request):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create job: {str(e)}"
+        )
+
+@router.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str, request: Request):
+    """
+    Retrieve the status and details of a specific job.
+    
+    This endpoint returns the current status and all relevant information
+    about a job identified by its job_id.
+    
+    ## Path Parameters
+    
+    - **job_id** (string, required): The UUID of the job to retrieve
+    
+    ## Response
+    
+    Returns job details including:
+    
+    - **job_id** (string): Unique identifier for the job (UUID)
+    - **task_type** (string): Type of job being executed
+    - **status** (string): Current job status:
+      - `queued` - Job is waiting to be processed
+      - `in_progress` - Job is currently being processed
+      - `completed` - Job has finished successfully
+      - `failed` - Job encountered an error
+    - **payload** (object, optional): Job payload data
+    - **callback_url** (string, optional): Webhook URL for notifications
+    - **created_at** (string): ISO timestamp when job was created
+    - **updated_at** (string, optional): ISO timestamp when job was last updated
+    - **retry_count** (integer): Number of retry attempts made
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    curl -X GET "http://localhost:8000/api/jobs/123e4567-e89b-12d3-a456-426614174000" \\
+         -H "X-API-Key: your_api_key"
+    ```
+    
+    ## Example Response
+    
+    ```json
+    {
+      "job_id": "123e4567-e89b-12d3-a456-426614174000",
+      "task_type": "email_send",
+      "status": "completed",
+      "payload": {
+        "to": "user@example.com",
+        "subject": "Hello World",
+        "body": "This is a test email"
+      },
+      "callback_url": "https://webhook.site/abc123",
+      "created_at": "2024-01-15T10:30:00Z",
+      "updated_at": "2024-01-15T10:30:05Z",
+      "retry_count": 0
+    }
+    ```
+    
+    ## Error Responses
+    
+    - **401 Unauthorized**: Missing or invalid API key
+    - **404 Not Found**: Job with the specified ID does not exist
+    - **422 Unprocessable Content**: Invalid job_id format (not a valid UUID)
+    - **500 Internal Server Error**: Database or server errors
+    
+    ## Status Values
+    
+    - **queued**: Job is waiting in the queue to be processed
+    - **in_progress**: Job is currently being processed by a worker
+    - **completed**: Job has finished successfully
+    - **failed**: Job encountered an error during processing
+    
+    ## Notes
+    
+    - Job payload is returned as-is from the database
+    - Timestamps are in ISO 8601 format with timezone information
+    - Retry count shows how many times the job has been retried
+    - Updated timestamp is only present if the job has been modified
+    """
+    try:
+        # User is already authenticated via middleware
+        user = request.state.user
+        
+        # Validate job_id format (basic UUID validation)
+        if not job_id or not validate_uuid(job_id):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid job_id format. Must be a valid UUID."
+            )
+        
+        # Retrieve job from database
+        job_data = await get_job_by_id(job_id)
+        
+        if not job_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job with ID '{job_id}' not found"
+            )
+        
+        return JobStatusResponse(**job_data)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve job: {str(e)}"
         )

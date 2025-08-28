@@ -9,6 +9,7 @@ import asyncpg
 import json
 from datetime import datetime
 from db.connection import get_pool
+from config.redis import get_redis_client
 
 router = APIRouter(tags=["Jobs"])
 
@@ -168,6 +169,24 @@ async def create_job(job_data: JobCreate, request: Request):
             job_data.payload,
             job_data.callback_url
         )
+        
+        # Push job to Redis queue
+        try:
+            job_queue_data = {
+                "job_id": job_id,
+                "task_type": job_data.task_type,
+                "payload": job_data.payload,
+                "callback_url": str(job_data.callback_url) if job_data.callback_url else None,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            
+            redis_client = await get_redis_client()
+            await redis_client.lpush("job_queue", json.dumps(job_queue_data))
+        except Exception as redis_error:
+            # Log Redis error but don't fail the job creation
+            # The job is already in the database and can be processed later
+            print(f"Warning: Failed to push job to Redis queue: {redis_error}")
+            # In production, you might want to log this to a proper logging system
         
         return JobResponse(
             job_id=job_id,

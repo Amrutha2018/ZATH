@@ -4,8 +4,8 @@ import asyncpg
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from .env.local if it exists
-load_dotenv('.env.local')
+# Load environment variables from .env file
+load_dotenv('.env')
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")

@@ -34,5 +34,19 @@ services:
       - .env
     restart: always
 
+  worker:
+    build:
+      context: ./zath_api
+    container_name: zath-worker
+    command: ["python", "workers/run_worker.py"]
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./zath_api:/app
+    env_file:
+      - .env
+    restart: always
+
 volumes:
   postgres_data:

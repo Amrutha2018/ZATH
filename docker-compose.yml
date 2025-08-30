@@ -48,5 +48,21 @@ services:
       - .env
     restart: always
 
+  zathfrontend:
+    build:
+      context: ./zath_frontend
+    container_name: zath-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - zathapi
+    volumes:
+      - ./zath_frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    restart: always
+
 volumes:
   postgres_data:

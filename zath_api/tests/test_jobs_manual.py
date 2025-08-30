@@ -19,7 +19,10 @@ async def test_jobs_api():
     async with aiohttp.ClientSession() as session:
         # 1. Register a user
         print("\n1. Registering user...")
-        user_data = {"email": f"jobs-test-{int(time.time())}@example.com"}
+        user_data = {
+            "email": f"jobs-test-{int(time.time())}@example.com",
+            "password": "testpass123"
+        }
         async with session.post(f"{BASE_URL}/auth/register", json=user_data) as response:
             user_info = await response.json()
             api_key = user_info["api_key"]

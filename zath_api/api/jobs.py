@@ -2,7 +2,8 @@
 Jobs API - Self-sufficient implementation
 Contains models, validation, database operations, and endpoints
 """
-from fastapi import APIRouter, HTTPException, status, Request
+import logging
+from fastapi import APIRouter, HTTPException, status, Request, Query
 from pydantic import BaseModel, HttpUrl, validator, Field
 from typing import Dict, Any, Optional
 import asyncpg
@@ -11,6 +12,9 @@ import uuid
 from datetime import datetime, timezone
 from db.connection import get_pool
 from config.redis import get_redis_client
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Jobs"])
 
@@ -89,41 +93,86 @@ class JobStatusResponse(BaseModel):
     retry_count: int = Field(..., description="Number of job retry attempts made")
     callback_retry_count: int = Field(..., description="Number of callback retry attempts made")
 
+class JobListItem(BaseModel):
+    """
+    Response model for job list items.
+    
+    Attributes:
+        job_id: Unique identifier for the job (UUID)
+        task_type: Type of job being executed
+        status: Current job status
+        callback_url: Webhook URL for notifications (if provided)
+        retry_count: Number of job retry attempts made
+        callback_retry_count: Number of callback retry attempts made
+        created_at: ISO timestamp when job was created
+        updated_at: ISO timestamp when job was last updated
+    """
+    job_id: str = Field(..., description="Unique identifier for the job (UUID)")
+    task_type: str = Field(..., description="Type of job being executed")
+    status: str = Field(..., description="Current job status")
+    callback_url: Optional[str] = Field(None, description="Webhook URL for notifications")
+    retry_count: int = Field(..., description="Number of job retry attempts made")
+    callback_retry_count: int = Field(..., description="Number of callback retry attempts made")
+    created_at: str = Field(..., description="ISO timestamp when job was created")
+    updated_at: Optional[str] = Field(None, description="ISO timestamp when job was last updated")
+
+class JobListResponse(BaseModel):
+    """
+    Response model for job list with pagination.
+    
+    Attributes:
+        jobs: List of job items
+        pagination: Pagination information
+    """
+    jobs: list[JobListItem] = Field(..., description="List of jobs")
+    pagination: Dict[str, Any] = Field(..., description="Pagination information")
+
 # Database Operations (self-contained)
-async def create_job_in_db(task_type: str, payload: dict, callback_url: str = None) -> str:
+async def create_job_in_db(task_type: str, payload: dict, callback_url: str = None, user_email: str = None) -> str:
     """Create a new job in the database and return job_id"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         job_id = await conn.fetchval(
             """
-            INSERT INTO jobs (id, task_type, payload, callback_url, status)
-            VALUES (gen_random_uuid(), $1, $2, $3, 'queued')
+            INSERT INTO jobs (id, user_email, task_type, payload, callback_url, status)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, 'queued')
             RETURNING id
             """,
-            task_type, json.dumps(payload), str(callback_url) if callback_url else None
+            user_email, task_type, json.dumps(payload), str(callback_url) if callback_url else None
         )
         return str(job_id)
 
-async def get_job_by_id(job_id: str) -> Optional[Dict[str, Any]]:
+async def get_job_by_id(job_id: str, user_email: str = None) -> Optional[Dict[str, Any]]:
     """
     Retrieve a job by its ID from the database.
     
     Args:
         job_id: The UUID of the job to retrieve
+        user_email: Email of the authenticated user (for job isolation)
         
     Returns:
         Job data as dictionary or None if not found
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Build WHERE clause for security
+        where_conditions = ["id = $1"]
+        params = [job_id]
+        
+        if user_email:
+            where_conditions.append("user_email = $2")
+            params.append(user_email)
+        
+        where_clause = " AND ".join(where_conditions)
+        
         job = await conn.fetchrow(
-            """
+            f"""
             SELECT id, task_type, payload, callback_url, status, 
                    retry_count, callback_retry_count, created_at, updated_at
             FROM jobs 
-            WHERE id = $1
+            WHERE {where_clause}
             """,
-            job_id
+            *params
         )
         
         if job:
@@ -147,6 +196,87 @@ async def get_job_by_id(job_id: str) -> Optional[Dict[str, Any]]:
                 "updated_at": job['updated_at'].isoformat() if job['updated_at'] else None
             }
         return None
+
+async def get_jobs_list(page: int = 1, limit: int = 20, status: str = None, task_type: str = None, user_email: str = None) -> Dict[str, Any]:
+    """
+    Retrieve a paginated list of jobs with optional filtering.
+    
+    Args:
+        page: Page number (1-based)
+        limit: Number of jobs per page
+        status: Filter by job status
+        task_type: Filter by task type
+        user_email: Email of the authenticated user (for job isolation)
+        
+    Returns:
+        Dictionary with jobs list and pagination info
+    """
+    pool = await get_pool()
+    offset = (page - 1) * limit
+    
+    # Build WHERE clause for filters
+    where_conditions = []
+    params = []
+    param_count = 0
+    
+    # Always filter by user email for security
+    if user_email:
+        param_count += 1
+        where_conditions.append(f"user_email = ${param_count}")
+        params.append(user_email)
+    
+    if status:
+        param_count += 1
+        where_conditions.append(f"status = ${param_count}")
+        params.append(status)
+    
+    if task_type:
+        param_count += 1
+        where_conditions.append(f"task_type = ${param_count}")
+        params.append(task_type)
+    
+    where_clause = " WHERE " + " AND ".join(where_conditions) if where_conditions else ""
+    
+    # Get total count
+    count_query = f"SELECT COUNT(*) FROM jobs{where_clause}"
+    total_count = await pool.fetchval(count_query, *params)
+    
+    # Get jobs with pagination
+    param_count += 1
+    jobs_query = f"""
+        SELECT id, task_type, status, callback_url, retry_count, callback_retry_count, 
+               created_at, updated_at
+        FROM jobs{where_clause}
+        ORDER BY created_at DESC
+        LIMIT ${param_count} OFFSET ${param_count + 1}
+    """
+    params.extend([limit, offset])
+    
+    jobs = await pool.fetch(jobs_query, *params)
+    
+    # Process jobs
+    jobs_list = []
+    for job in jobs:
+        jobs_list.append({
+            "job_id": str(job['id']),
+            "task_type": job['task_type'],
+            "status": job['status'],
+            "callback_url": job['callback_url'],
+            "retry_count": job['retry_count'],
+            "callback_retry_count": job['callback_retry_count'],
+            "created_at": job['created_at'].isoformat() if job['created_at'] else None,
+            "updated_at": job['updated_at'].isoformat() if job['updated_at'] else None,
+        })
+    
+    return {
+        "jobs": jobs_list,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_count,
+            "pages": (total_count + limit - 1) // limit
+        }
+    }
 
 # API Endpoint
 @router.post("/jobs", response_model=JobResponse, status_code=202)
@@ -254,7 +384,8 @@ async def create_job(job_data: JobCreate, request: Request):
         job_id = await create_job_in_db(
             job_data.task_type,
             job_data.payload,
-            job_data.callback_url
+            job_data.callback_url,
+            user['email']
         )
         
         # Push job to Redis queue
@@ -272,7 +403,7 @@ async def create_job(job_data: JobCreate, request: Request):
         except Exception as redis_error:
             # Log Redis error but don't fail the job creation
             # The job is already in the database and can be processed later
-            print(f"Warning: Failed to push job to Redis queue: {redis_error}")
+            logger.warning(f"Failed to push job to Redis queue: {redis_error}")
             # In production, you might want to log this to a proper logging system
         
         return JobResponse(
@@ -389,7 +520,7 @@ async def get_job_status(job_id: str, request: Request):
             )
         
         # Retrieve job from database
-        job_data = await get_job_by_id(job_id)
+        job_data = await get_job_by_id(job_id, user['email'])
         
         if not job_data:
             raise HTTPException(
@@ -406,4 +537,113 @@ async def get_job_status(job_id: str, request: Request):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve job: {str(e)}"
+        )
+
+@router.get("/jobs", response_model=JobListResponse)
+async def list_jobs(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    limit: int = Query(20, ge=1, le=100, description="Number of jobs per page"),
+    status: Optional[str] = Query(None, description="Filter by job status"),
+    task_type: Optional[str] = Query(None, description="Filter by task type")
+):
+    """
+    List all jobs with pagination and filtering.
+    
+    This endpoint returns a paginated list of jobs with optional filtering by status and task type.
+    
+    ## Query Parameters
+    
+    - **page** (integer, optional): Page number (default: 1, minimum: 1)
+    - **limit** (integer, optional): Number of jobs per page (default: 20, minimum: 1, maximum: 100)
+    - **status** (string, optional): Filter by job status (queued, in_progress, completed, failed)
+    - **task_type** (string, optional): Filter by task type
+    
+    ## Response
+    
+    Returns a paginated list of jobs:
+    
+    - **jobs** (array): List of job items with basic information
+    - **pagination** (object): Pagination information including:
+      - **page**: Current page number
+      - **limit**: Jobs per page
+      - **total**: Total number of jobs
+      - **pages**: Total number of pages
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    # Get first page of all jobs
+    curl -X GET "http://localhost:8000/api/jobs" \\
+         -H "X-API-Key: your_api_key"
+    
+    # Get completed jobs only
+    curl -X GET "http://localhost:8000/api/jobs?status=completed" \\
+         -H "X-API-Key: your_api_key"
+    
+    # Get email jobs with pagination
+    curl -X GET "http://localhost:8000/api/jobs?task_type=email_send&page=2&limit=10" \\
+         -H "X-API-Key: your_api_key"
+    ```
+    
+    ## Example Response
+    
+    ```json
+    {
+      "jobs": [
+        {
+          "job_id": "123e4567-e89b-12d3-a456-426614174000",
+          "task_type": "email_send",
+          "status": "completed",
+          "callback_url": "https://webhook.site/abc123",
+          "retry_count": 0,
+          "callback_retry_count": 0,
+          "created_at": "2024-01-15T10:30:00Z",
+          "updated_at": "2024-01-15T10:30:05Z"
+        }
+      ],
+      "pagination": {
+        "page": 1,
+        "limit": 20,
+        "total": 1,
+        "pages": 1
+      }
+    }
+    ```
+    
+    ## Error Responses
+    
+    - **401 Unauthorized**: Missing or invalid API key
+    - **422 Unprocessable Content**: Invalid query parameters
+    - **500 Internal Server Error**: Database or server errors
+    """
+    try:
+        # User is already authenticated via middleware
+        user = request.state.user
+        
+        # Validate status filter if provided
+        if status and status not in ['queued', 'in_progress', 'completed', 'failed']:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid status filter. Must be one of: queued, in_progress, completed, failed"
+            )
+        
+        # Get jobs list from database
+        jobs_data = await get_jobs_list(page, limit, status, task_type, user['email'])
+        
+        return JobListResponse(**jobs_data)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve jobs list: {str(e)}"
         )

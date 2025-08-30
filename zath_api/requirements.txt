@@ -8,3 +8,5 @@ pytest
 pytest-asyncio
 aiohttp
 redis
+bcrypt
+python-jose[cryptography]

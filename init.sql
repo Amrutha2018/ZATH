@@ -1,6 +1,7 @@
 -- jobs table
 CREATE TABLE jobs (
 id UUID PRIMARY KEY,
+user_email VARCHAR(255) NOT NULL,
 task_type VARCHAR(50),
 payload JSONB,
 callback_url TEXT,
@@ -21,6 +22,7 @@ created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 CREATE TABLE users (
 id UUID PRIMARY KEY,
 email VARCHAR(255) UNIQUE NOT NULL,
+password_hash VARCHAR(255) NOT NULL,
 api_key VARCHAR(255) UNIQUE NOT NULL,
 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );

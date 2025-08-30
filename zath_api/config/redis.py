@@ -5,11 +5,15 @@ This module provides Redis client configuration and connection management
 for the job queue system.
 """
 
+import logging
 import os
 from typing import Optional
 
 import redis.asyncio as redis
 from dotenv import load_dotenv
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -38,7 +42,7 @@ try:
         health_check_interval=30
     )
 except Exception as e:
-    print(f"Warning: Failed to initialize Redis client: {e}")
+    logger.warning(f"Failed to initialize Redis client: {e}")
     redis_client = None
 
 

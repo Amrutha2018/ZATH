@@ -6,13 +6,22 @@ import secrets
 import hashlib
 
 # Skip auth for these paths
-PUBLIC_PATHS = {"/", "/docs", "/redoc", "/openapi.json", "/auth/register", "/auth/login"}
+PUBLIC_PATHS = {
+    "/", "/docs", "/redoc", "/openapi.json", 
+    "/auth/register", "/auth/login", 
+    "/auth/forgot-password", "/auth/simple-reset-password", "/auth/validate-reset-token", "/auth/reset-password"
+}
 
 async def verify_api_key(request: Request):
     """Middleware to verify API key for all requests"""
     
-    # Skip auth for public paths
-    if request.url.path in PUBLIC_PATHS:
+    # Skip auth for public paths and OPTIONS requests (CORS preflight)
+    if request.url.path in PUBLIC_PATHS or request.method == "OPTIONS":
+        return
+    
+    # Check if this is a JWT-protected endpoint
+    if request.url.path == "/auth/me":
+        # Let the endpoint handle JWT authentication
         return
     
     # Get API key from header

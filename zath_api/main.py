@@ -1,6 +1,7 @@
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.responses import JSONResponse
@@ -40,12 +41,43 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Closing DB connection pool...")
     await close_db_pool()
 
-app = FastAPI(lifespan=lifespan)
+# Define security schemes for API documentation
+security_schemes = {
+    "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Enter your API key"
+    },
+    "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API Key",
+        "description": "Enter your API key as Bearer token"
+    }
+}
+
+app = FastAPI(
+    title="ZATH API",
+    description="Asynchronous Job Processing System",
+    version="1.0.0",
+    lifespan=lifespan,
+    openapi_tags=[
+        {
+            "name": "Authentication",
+            "description": "User authentication and API key management"
+        },
+        {
+            "name": "Jobs",
+            "description": "Job creation, status checking, and management"
+        }
+    ]
+)
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,6 +85,41 @@ app.add_middleware(
 
 # Add auth middleware
 app.add_middleware(AuthMiddleware)
+
+# Customize OpenAPI schema to include security schemes
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    from fastapi.openapi.utils import get_openapi
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    
+    # Add security schemes
+    openapi_schema["components"]["securitySchemes"] = security_schemes
+    
+    # Add security requirements to protected endpoints
+    for path, path_item in openapi_schema["paths"].items():
+        # Skip public paths
+        if path in ["/", "/docs", "/redoc", "/openapi.json", "/auth/register", "/auth/login", "/auth/forgot-password", "/auth/simple-reset-password"]:
+            continue
+            
+        # Add security to all methods in protected paths
+        for method, operation in path_item.items():
+            if method in ["get", "post", "put", "delete", "patch"]:
+                operation["security"] = [
+                    {"ApiKeyAuth": []},
+                    {"BearerAuth": []}
+                ]
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
 
 # Include auth routes
 app.include_router(auth_router)

@@ -1,0 +1,28 @@
+# Development override for Mac development
+# Use: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  zathfrontend:
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost:8001
+    # Development-specific settings
+    volumes:
+      - ./zath_frontend:/app
+      - /app/node_modules
+
+  zathapi:
+    # Development-specific settings
+    volumes:
+      - ./zath_api:/app
+    environment:
+      - PYTHONPATH=/app
+      - ENVIRONMENT=development
+
+  worker:
+    # Development-specific settings
+    volumes:
+      - ./zath_api:/app
+    environment:
+      - PYTHONPATH=/app
+      - ENVIRONMENT=development

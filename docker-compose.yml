@@ -1,9 +1,13 @@
+# Base Docker Compose configuration
+# Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Or: docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+
 services:
   redis:
     image: redis:7
     container_name: zath-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     restart: always
 
   postgres:
@@ -14,9 +18,10 @@ services:
       POSTGRES_USER: zathuser
       POSTGRES_PASSWORD: zathpass
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     restart: always
 
   zathapi:
@@ -24,7 +29,7 @@ services:
       context: ./zath_api
     container_name: zath-api
     ports:
-      - "8000:8000"
+      - "8001:8000"
     depends_on:
       - redis
       - postgres
@@ -53,7 +58,7 @@ services:
       context: ./zath_frontend
     container_name: zath-frontend
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on:
       - zathapi
     volumes:
@@ -61,7 +66,6 @@ services:
       - /app/node_modules
     environment:
       - NODE_ENV=development
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
     restart: always
 
 volumes:

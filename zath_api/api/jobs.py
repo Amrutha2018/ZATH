@@ -1,17 +1,26 @@
 """
 Jobs API - Self-sufficient implementation
-Contains models, validation, database operations, and endpoints
+
+Contains models, validation, database operations, and endpoints for job management
+and Redis-based dead letter queue functionality.
 """
-import logging
-from fastapi import APIRouter, HTTPException, status, Request, Query
-from pydantic import BaseModel, HttpUrl, validator, Field
-from typing import Dict, Any, Optional
-import asyncpg
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
-from db.connection import get_pool
+from typing import Dict, Any, Optional
+
+import asyncpg
+from fastapi import APIRouter, HTTPException, Request, Query, status
+from pydantic import BaseModel, Field, HttpUrl, validator
+
 from config.redis import get_redis_client
+from db.connection import get_pool
+from workers.dead_letter_queue import (
+    get_dead_letter_jobs,
+    get_dead_letter_queue_stats,
+    retry_dead_letter_job
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -53,7 +62,17 @@ class JobCreate(BaseModel):
     def validate_task_type(cls, v):
         if not v or not v.strip():
             raise ValueError('task_type cannot be empty')
-        return v.strip()
+        
+        valid_task_types = {
+            'http_call', 'data_transform', 'email_send', 
+            'webhook_call', 'file_upload', 'report_generate'
+        }
+        
+        task_type = v.strip()
+        if task_type not in valid_task_types:
+            raise ValueError(f'Invalid task_type: {task_type}. Must be one of: {", ".join(sorted(valid_task_types))}')
+        
+        return task_type
 
 class JobResponse(BaseModel):
     """
@@ -125,6 +144,42 @@ class JobListResponse(BaseModel):
         pagination: Pagination information
     """
     jobs: list[JobListItem] = Field(..., description="List of jobs")
+    pagination: Dict[str, Any] = Field(..., description="Pagination information")
+
+class DeadLetterJob(BaseModel):
+    """
+    Model for dead letter queue jobs.
+    
+    Attributes:
+        dlq_id: Dead letter queue job ID
+        job_id: Original job ID
+        task_type: Type of job that failed
+        payload: Original job payload
+        error_message: Error message from failure
+        retry_count: Number of retry attempts made
+        max_retries: Maximum retry attempts allowed
+        created_at: When the job was moved to dead letter queue
+        updated_at: When the entry was last updated
+    """
+    dlq_id: str = Field(..., description="Dead letter queue job ID")
+    job_id: str = Field(..., description="Original job ID")
+    task_type: str = Field(..., description="Type of job that failed")
+    payload: Optional[Dict[str, Any]] = Field(None, description="Original job payload")
+    error_message: str = Field(..., description="Error message from failure")
+    retry_count: int = Field(..., description="Number of retry attempts made")
+    max_retries: int = Field(..., description="Maximum retry attempts allowed")
+    created_at: str = Field(..., description="When the job was moved to dead letter queue")
+    updated_at: Optional[str] = Field(None, description="When the entry was last updated")
+
+class DeadLetterListResponse(BaseModel):
+    """
+    Response model for dead letter queue list with pagination.
+    
+    Attributes:
+        jobs: List of dead letter jobs
+        pagination: Pagination information
+    """
+    jobs: list[DeadLetterJob] = Field(..., description="List of dead letter jobs")
     pagination: Dict[str, Any] = Field(..., description="Pagination information")
 
 # Database Operations (self-contained)
@@ -277,6 +332,9 @@ async def get_jobs_list(page: int = 1, limit: int = 20, status: str = None, task
             "pages": (total_count + limit - 1) // limit
         }
     }
+
+# Note: Dead letter queue operations are now handled by workers/dead_letter_queue.py
+# This uses Redis instead of database tables for better performance
 
 # API Endpoint
 @router.post("/jobs", response_model=JobResponse, status_code=202)
@@ -646,4 +704,243 @@ async def list_jobs(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve jobs list: {str(e)}"
+        )
+
+@router.get("/dead-letter-queue", response_model=DeadLetterListResponse)
+async def list_dead_letter_jobs(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    limit: int = Query(20, ge=1, le=100, description="Number of jobs per page"),
+    task_type: Optional[str] = Query(None, description="Filter by task type")
+):
+    """
+    List all jobs in the Redis dead letter queue with pagination and filtering.
+    
+    This endpoint returns a paginated list of jobs that have failed processing
+    and are stored in the Redis dead letter queue for inspection and potential retry.
+    
+    ## Query Parameters
+    
+    - **page** (integer, optional): Page number (default: 1, minimum: 1)
+    - **limit** (integer, optional): Number of jobs per page (default: 20, minimum: 1, maximum: 100)
+    - **task_type** (string, optional): Filter by task type
+    
+    ## Response
+    
+    Returns a paginated list of dead letter jobs:
+    
+    - **jobs** (array): List of dead letter job items with failure information
+    - **pagination** (object): Pagination information including:
+      - **page**: Current page number
+      - **limit**: Jobs per page
+      - **total**: Total number of dead letter jobs
+      - **pages**: Total number of pages
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    # Get first page of all dead letter jobs
+    curl -X GET "http://localhost:8001/api/dead-letter-queue" \\
+         -H "X-API-Key: your_api_key"
+    
+    # Get dead letter jobs for specific task type
+    curl -X GET "http://localhost:8001/api/dead-letter-queue?task_type=data_transform" \\
+         -H "X-API-Key: your_api_key"
+    ```
+    
+    ## Example Response
+    
+    ```json
+    {
+      "jobs": [
+        {
+          "dlq_id": "dlq_123456",
+          "job_id": "123e4567-e89b-12d3-a456-426614174000",
+          "task_type": "data_transform",
+          "payload": {"input": "data"},
+          "error_message": "Invalid input format",
+          "retry_count": 2,
+          "max_retries": 3,
+          "created_at": "2024-01-15T10:30:00Z",
+          "updated_at": "2024-01-15T10:35:00Z"
+        }
+      ],
+      "pagination": {
+        "page": 1,
+        "limit": 20,
+        "total": 1,
+        "pages": 1
+      }
+    }
+    ```
+    
+    ## Error Responses
+    
+    - **401 Unauthorized**: Missing or invalid API key
+    - **422 Unprocessable Content**: Invalid query parameters
+    - **500 Internal Server Error**: Redis or server errors
+    """
+    try:
+        # User is already authenticated via middleware
+        user = request.state.user
+        
+        # Get dead letter jobs list from Redis
+        jobs_data = await get_dead_letter_jobs(page, limit, task_type)
+        
+        return DeadLetterListResponse(**jobs_data)
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve dead letter jobs list: {str(e)}"
+        )
+
+@router.post("/dead-letter-queue/{dlq_id}/retry")
+async def retry_dead_letter_job_endpoint(dlq_id: str, request: Request):
+    """
+    Retry a job from the Redis dead letter queue.
+    
+    This endpoint moves a failed job from the Redis dead letter queue back to the main
+    processing queue for retry, if it hasn't exceeded the maximum retry count.
+    
+    ## Path Parameters
+    
+    - **dlq_id** (string, required): The dead letter queue job ID (e.g., "dlq_123456")
+    
+    ## Response
+    
+    Returns success status:
+    
+    - **success** (boolean): Whether the retry was successful
+    - **message** (string): Success or error message
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    curl -X POST "http://localhost:8001/api/dead-letter-queue/dlq_123456/retry" \\
+         -H "X-API-Key: your_api_key"
+    ```
+    
+    ## Example Response
+    
+    ```json
+    {
+      "success": true,
+      "message": "Job successfully moved back to processing queue"
+    }
+    ```
+    
+    ## Error Responses
+    
+    - **401 Unauthorized**: Missing or invalid API key
+    - **404 Not Found**: Dead letter job with specified ID not found
+    - **422 Unprocessable Content**: Invalid dlq_id format
+    - **500 Internal Server Error**: Redis or server errors
+    """
+    try:
+        # User is already authenticated via middleware
+        user = request.state.user
+        
+        # Retry the dead letter job
+        success = await retry_dead_letter_job(dlq_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Job successfully moved back to processing queue"
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Dead letter job with ID '{dlq_id}' not found or has exceeded maximum retry count"
+            )
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retry dead letter job: {str(e)}"
+        )
+
+@router.get("/dead-letter-queue/stats")
+async def get_dead_letter_queue_stats_endpoint(request: Request):
+    """
+    Get statistics about the Redis dead letter queue.
+    
+    This endpoint returns statistics about jobs in the dead letter queue,
+    including total count and breakdown by task type.
+    
+    ## Response
+    
+    Returns dead letter queue statistics:
+    
+    - **total_jobs** (integer): Total number of jobs in dead letter queue
+    - **task_type_breakdown** (object): Count of jobs by task type
+    - **queue_name** (string): Name of the Redis queue
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    curl -X GET "http://localhost:8001/api/dead-letter-queue/stats" \\
+         -H "X-API-Key: your_api_key"
+    ```
+    
+    ## Example Response
+    
+    ```json
+    {
+      "total_jobs": 5,
+      "task_type_breakdown": {
+        "data_transform": 2,
+        "http_call": 2,
+        "email_send": 1
+      },
+      "queue_name": "dead_letter_queue"
+    }
+    ```
+    
+    ## Error Responses
+    
+    - **401 Unauthorized**: Missing or invalid API key
+    - **500 Internal Server Error**: Redis or server errors
+    """
+    try:
+        # User is already authenticated via middleware
+        user = request.state.user
+        
+        # Get dead letter queue statistics from Redis
+        stats = await get_dead_letter_queue_stats()
+        
+        return stats
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get dead letter queue stats: {str(e)}"
         )

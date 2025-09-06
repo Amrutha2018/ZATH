@@ -706,6 +706,254 @@ async def list_jobs(
             detail=f"Failed to retrieve jobs list: {str(e)}"
         )
 
+
+@router.post("/jobs/{job_id}/retry", response_model=JobResponse)
+async def retry_job(job_id: str, request: Request):
+    """
+    Retry a failed or cancelled job.
+    
+    This endpoint allows retrying a job that has failed or been cancelled.
+    The job will be re-queued with the same payload and parameters.
+    
+    ## Path Parameters
+    
+    - **job_id** (string, required): The UUID of the job to retry
+    
+    ## Response
+    
+    Returns the retried job details:
+    
+    - **job_id** (string): Unique identifier for the job (UUID)
+    - **status** (string): Current job status (queued)
+    - **created_at** (string): ISO timestamp when job was created
+    - **task_type** (string): Type of job being executed
+    - **payload** (object): Job payload and parameters
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    # Retry a failed job
+    curl -X POST "http://localhost:8001/api/jobs/123e4567-e89b-12d3-a456-426614174000/retry" \\
+         -H "X-API-Key: your_api_key_here"
+    ```
+    
+    ## Error Responses
+    
+    - **404 Not Found**: Job not found
+    - **400 Bad Request**: Job cannot be retried (e.g., already in progress)
+    - **401 Unauthorized**: Invalid or missing API key
+    - **500 Internal Server Error**: Server error during retry
+    """
+    # Validate job_id format
+    if not validate_uuid(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid job_id format. Must be a valid UUID."
+        )
+    
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Get the job details
+            job_row = await conn.fetchrow(
+                """
+                SELECT id, task_type, payload, status, created_at, user_email
+                FROM jobs 
+                WHERE id = $1
+                """,
+                job_id
+            )
+            
+            if not job_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Job {job_id} not found"
+                )
+            
+            # Check if job can be retried
+            current_status = job_row['status']
+            if current_status == 'in_progress':
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot retry job that is currently in progress"
+                )
+            
+            if current_status == 'queued':
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Job is already queued"
+                )
+            
+            # Create a new job with the same parameters
+            new_job_id = str(uuid.uuid4())
+            new_created_at = datetime.now(timezone.utc)
+            
+            await conn.execute(
+                """
+                INSERT INTO jobs (id, task_type, payload, status, created_at, user_email)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                new_job_id,
+                job_row['task_type'],
+                job_row['payload'],
+                'queued',
+                new_created_at,
+                job_row['user_email']
+            )
+            
+            # Add to Redis queue
+            redis_client = await get_redis_client()
+            job_data = {
+                'job_id': new_job_id,
+                'task_type': job_row['task_type'],
+                'payload': job_row['payload'],
+                'user_email': job_row['user_email']
+            }
+            await redis_client.lpush('job_queue', json.dumps(job_data))
+            
+            logger.info(f"Job {job_id} retried as {new_job_id}")
+            
+            return JobResponse(
+                job_id=new_job_id,
+                status='queued',
+                created_at=new_created_at.isoformat(),
+                task_type=job_row['task_type'],
+                payload=job_row['payload']
+            )
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Error retrying job {job_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retry job: {str(e)}"
+        )
+
+
+@router.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str, request: Request):
+    """
+    Cancel a queued job.
+    
+    This endpoint cancels a job that is currently queued but not yet started.
+    Jobs that are in progress or already completed cannot be cancelled.
+    
+    ## Path Parameters
+    
+    - **job_id** (string, required): The UUID of the job to cancel
+    
+    ## Response
+    
+    Returns a success message:
+    
+    - **message** (string): Confirmation message
+    - **job_id** (string): The cancelled job ID
+    - **status** (string): Final status of the job (cancelled)
+    
+    ## Authentication
+    
+    Requires valid API key in header:
+    - `X-API-Key: your_api_key_here`
+    - `Authorization: Bearer your_api_key_here`
+    
+    ## Example Usage
+    
+    ```bash
+    # Cancel a queued job
+    curl -X DELETE "http://localhost:8001/api/jobs/123e4567-e89b-12d3-a456-426614174000" \\
+         -H "X-API-Key: your_api_key_here"
+    ```
+    
+    ## Error Responses
+    
+    - **404 Not Found**: Job not found
+    - **400 Bad Request**: Job cannot be cancelled (e.g., already in progress)
+    - **401 Unauthorized**: Invalid or missing API key
+    - **500 Internal Server Error**: Server error during cancellation
+    """
+    # Validate job_id format
+    if not validate_uuid(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid job_id format. Must be a valid UUID."
+        )
+    
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Get the job details
+            job_row = await conn.fetchrow(
+                """
+                SELECT id, status
+                FROM jobs 
+                WHERE id = $1
+                """,
+                job_id
+            )
+            
+            if not job_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Job {job_id} not found"
+                )
+            
+            # Check if job can be cancelled
+            current_status = job_row['status']
+            if current_status == 'in_progress':
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot cancel job that is currently in progress"
+                )
+            
+            if current_status in ['completed', 'failed', 'cancelled']:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Job is already {current_status} and cannot be cancelled"
+                )
+            
+            # Update job status to cancelled
+            await conn.execute(
+                """
+                UPDATE jobs 
+                SET status = 'cancelled', updated_at = $1
+                WHERE id = $2
+                """,
+                datetime.now(timezone.utc),
+                job_id
+            )
+            
+            # Remove from Redis queue if it exists there
+            redis_client = await get_redis_client()
+            # Note: We can't easily remove a specific job from the queue without scanning
+            # The worker will handle cancelled jobs by checking the database status
+            
+            logger.info(f"Job {job_id} cancelled")
+            
+            return {
+                "message": f"Job {job_id} has been cancelled",
+                "job_id": job_id,
+                "status": "cancelled"
+            }
+            
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling job {job_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cancel job: {str(e)}"
+        )
+
+
 @router.get("/dead-letter-queue", response_model=DeadLetterListResponse)
 async def list_dead_letter_jobs(
     request: Request,

@@ -27,7 +27,6 @@ import {
   DialogTitle,
   DialogContent,
   DialogActions,
-  Grid,
   Tooltip,
   CircularProgress,
 } from "@mui/material";
@@ -36,6 +35,8 @@ import {
   Visibility as ViewIcon,
   FilterList as FilterIcon,
   Clear as ClearIcon,
+  Replay as RetryIcon,
+  Cancel as CancelIcon,
 } from "@mui/icons-material";
 import { api, JobListItem, JobStatus } from "@/lib/api";
 
@@ -83,6 +84,13 @@ export function JobDashboard() {
 
   // Auto-refresh
   const [autoRefresh, setAutoRefresh] = useState(true);
+
+  // Action states
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<{
+    type: "success" | "error";
+    text: string;
+  } | null>(null);
 
   const loadJobs = async () => {
     try {
@@ -133,6 +141,63 @@ export function JobDashboard() {
     value: number
   ) => {
     setPage(value);
+  };
+
+  const handleRetryJob = async (jobId: string) => {
+    try {
+      setActionLoading(jobId);
+      setActionMessage(null);
+
+      const result = await api.retryJob(jobId);
+      setActionMessage({
+        type: "success",
+        text: `Job retried successfully. New job ID: ${result.job_id.substring(
+          0,
+          8
+        )}...`,
+      });
+
+      // Refresh the jobs list
+      await loadJobs();
+    } catch (err: any) {
+      setActionMessage({
+        type: "error",
+        text: err.response?.data?.detail || "Failed to retry job",
+      });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleCancelJob = async (jobId: string) => {
+    try {
+      setActionLoading(jobId);
+      setActionMessage(null);
+
+      const result = await api.cancelJob(jobId);
+      setActionMessage({
+        type: "success",
+        text: result.message,
+      });
+
+      // Refresh the jobs list
+      await loadJobs();
+    } catch (err: any) {
+      setActionMessage({
+        type: "error",
+        text: err.response?.data?.detail || "Failed to cancel job",
+      });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const canRetryJob = (status: string) => {
+    return status === "failed" || status === "cancelled";
+  };
+
+  const canCancelJob = (status: string) => {
+    return status === "queued";
   };
 
   // Auto-refresh effect
@@ -193,6 +258,16 @@ export function JobDashboard() {
           </Alert>
         )}
 
+        {actionMessage && (
+          <Alert
+            severity={actionMessage.type}
+            sx={{ mb: 2 }}
+            onClose={() => setActionMessage(null)}
+          >
+            {actionMessage.text}
+          </Alert>
+        )}
+
         {/* Filters */}
         <Paper sx={{ p: 2, mb: 3 }}>
           <Box sx={{ display: "flex", alignItems: "center", mb: 2 }}>
@@ -200,8 +275,15 @@ export function JobDashboard() {
             <Typography variant="h6">Filters</Typography>
           </Box>
 
-          <Grid container spacing={2} alignItems="center">
-            <Grid item xs={12} sm={6} md={3}>
+          <Box
+            sx={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 2,
+              alignItems: "center",
+            }}
+          >
+            <Box sx={{ minWidth: 200, flex: "1 1 200px" }}>
               <FormControl fullWidth size="small">
                 <InputLabel>Status</InputLabel>
                 <Select
@@ -216,9 +298,9 @@ export function JobDashboard() {
                   <MenuItem value="failed">Failed</MenuItem>
                 </Select>
               </FormControl>
-            </Grid>
+            </Box>
 
-            <Grid item xs={12} sm={6} md={3}>
+            <Box sx={{ minWidth: 200, flex: "1 1 200px" }}>
               <FormControl fullWidth size="small">
                 <InputLabel>Task Type</InputLabel>
                 <Select
@@ -227,17 +309,17 @@ export function JobDashboard() {
                   onChange={(e) => setTaskTypeFilter(e.target.value)}
                 >
                   <MenuItem value="">All Types</MenuItem>
+                  <MenuItem value="http_call">HTTP Call</MenuItem>
+                  <MenuItem value="data_transform">Data Transform</MenuItem>
                   <MenuItem value="email_send">Send Email</MenuItem>
-                  <MenuItem value="data_process">Process Data</MenuItem>
                   <MenuItem value="webhook_call">Webhook Call</MenuItem>
                   <MenuItem value="file_upload">File Upload</MenuItem>
                   <MenuItem value="report_generate">Generate Report</MenuItem>
-                  <MenuItem value="custom_task">Custom Task</MenuItem>
                 </Select>
               </FormControl>
-            </Grid>
+            </Box>
 
-            <Grid item xs={12} sm={6} md={3}>
+            <Box sx={{ minWidth: 200, flex: "1 1 200px" }}>
               <TextField
                 fullWidth
                 size="small"
@@ -246,9 +328,9 @@ export function JobDashboard() {
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder="Search by ID, type, or status"
               />
-            </Grid>
+            </Box>
 
-            <Grid item xs={12} sm={6} md={3}>
+            <Box sx={{ minWidth: 150, flex: "0 0 auto" }}>
               <Button
                 variant="outlined"
                 startIcon={<ClearIcon />}
@@ -257,8 +339,8 @@ export function JobDashboard() {
               >
                 Clear Filters
               </Button>
-            </Grid>
-          </Grid>
+            </Box>
+          </Box>
         </Paper>
 
         {/* Jobs Table */}
@@ -314,15 +396,51 @@ export function JobDashboard() {
                       </Typography>
                     </TableCell>
                     <TableCell>
-                      <Tooltip title="View Details">
-                        <IconButton
-                          size="small"
-                          onClick={() => loadJobDetails(job.job_id)}
-                          disabled={detailsLoading}
-                        >
-                          <ViewIcon />
-                        </IconButton>
-                      </Tooltip>
+                      <Box sx={{ display: "flex", gap: 0.5 }}>
+                        <Tooltip title="View Details">
+                          <IconButton
+                            size="small"
+                            onClick={() => loadJobDetails(job.job_id)}
+                            disabled={detailsLoading}
+                          >
+                            <ViewIcon />
+                          </IconButton>
+                        </Tooltip>
+
+                        {canRetryJob(job.status) && (
+                          <Tooltip title="Retry Job">
+                            <IconButton
+                              size="small"
+                              onClick={() => handleRetryJob(job.job_id)}
+                              disabled={actionLoading === job.job_id}
+                              color="primary"
+                            >
+                              {actionLoading === job.job_id ? (
+                                <CircularProgress size={16} />
+                              ) : (
+                                <RetryIcon />
+                              )}
+                            </IconButton>
+                          </Tooltip>
+                        )}
+
+                        {canCancelJob(job.status) && (
+                          <Tooltip title="Cancel Job">
+                            <IconButton
+                              size="small"
+                              onClick={() => handleCancelJob(job.job_id)}
+                              disabled={actionLoading === job.job_id}
+                              color="error"
+                            >
+                              {actionLoading === job.job_id ? (
+                                <CircularProgress size={16} />
+                              ) : (
+                                <CancelIcon />
+                              )}
+                            </IconButton>
+                          </Tooltip>
+                        )}
+                      </Box>
                     </TableCell>
                   </TableRow>
                 ))
@@ -422,8 +540,8 @@ export function JobDashboard() {
                 </Box>
 
                 {/* Main Information Grid */}
-                <Grid container spacing={3} sx={{ mb: 4 }}>
-                  <Grid item xs={12} sm={6}>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 2, mb: 4 }}>
+                  <Box sx={{ flex: "1 1 200px", minWidth: 200 }}>
                     <Box sx={{ p: 2, bgcolor: "grey.50", borderRadius: 1 }}>
                       <Typography
                         variant="caption"
@@ -436,10 +554,10 @@ export function JobDashboard() {
                         {formatDate(selectedJob.created_at)}
                       </Typography>
                     </Box>
-                  </Grid>
+                  </Box>
 
                   {selectedJob.updated_at && (
-                    <Grid item xs={12} sm={6}>
+                    <Box sx={{ flex: "1 1 200px", minWidth: 200 }}>
                       <Box sx={{ p: 2, bgcolor: "grey.50", borderRadius: 1 }}>
                         <Typography
                           variant="caption"
@@ -452,10 +570,10 @@ export function JobDashboard() {
                           {formatDate(selectedJob.updated_at)}
                         </Typography>
                       </Box>
-                    </Grid>
+                    </Box>
                   )}
 
-                  <Grid item xs={12} sm={6}>
+                  <Box sx={{ flex: "1 1 200px", minWidth: 200 }}>
                     <Box sx={{ p: 2, bgcolor: "grey.50", borderRadius: 1 }}>
                       <Typography
                         variant="caption"
@@ -468,9 +586,9 @@ export function JobDashboard() {
                         {selectedJob.retry_count}
                       </Typography>
                     </Box>
-                  </Grid>
+                  </Box>
 
-                  <Grid item xs={12} sm={6}>
+                  <Box sx={{ flex: "1 1 200px", minWidth: 200 }}>
                     <Box sx={{ p: 2, bgcolor: "grey.50", borderRadius: 1 }}>
                       <Typography
                         variant="caption"
@@ -483,8 +601,8 @@ export function JobDashboard() {
                         {selectedJob.callback_retry_count}
                       </Typography>
                     </Box>
-                  </Grid>
-                </Grid>
+                  </Box>
+                </Box>
 
                 {/* Callback URL Section */}
                 {selectedJob.callback_url && (
@@ -514,7 +632,7 @@ export function JobDashboard() {
 
                 {/* Payload Section */}
                 {selectedJob.payload && (
-                  <Box>
+                  <Box sx={{ mb: 4 }}>
                     <Typography variant="subtitle2" gutterBottom>
                       Payload Data
                     </Typography>
@@ -543,11 +661,175 @@ export function JobDashboard() {
                     </Paper>
                   </Box>
                 )}
+
+                {/* Result Section */}
+                {selectedJob.result && (
+                  <Box sx={{ mb: 4 }}>
+                    <Typography variant="subtitle2" gutterBottom>
+                      Job Result
+                    </Typography>
+                    <Paper
+                      sx={{
+                        p: 2,
+                        bgcolor:
+                          selectedJob.status === "failed"
+                            ? "error.50"
+                            : "success.50",
+                        border: "1px solid",
+                        borderColor:
+                          selectedJob.status === "failed"
+                            ? "error.200"
+                            : "success.200",
+                        borderRadius: 1,
+                        maxHeight: 300,
+                        overflow: "auto",
+                      }}
+                    >
+                      <pre
+                        style={{
+                          margin: 0,
+                          fontFamily: "monospace",
+                          fontSize: "0.875rem",
+                          lineHeight: 1.5,
+                          color:
+                            selectedJob.status === "failed"
+                              ? "#dc2626"
+                              : "#059669",
+                        }}
+                      >
+                        {JSON.stringify(selectedJob.result, null, 2)}
+                      </pre>
+                    </Paper>
+                  </Box>
+                )}
+
+                {/* Error Section */}
+                {selectedJob.error_message && (
+                  <Box sx={{ mb: 4 }}>
+                    <Typography variant="subtitle2" gutterBottom color="error">
+                      Error Message
+                    </Typography>
+                    <Paper
+                      sx={{
+                        p: 2,
+                        bgcolor: "error.50",
+                        border: "1px solid",
+                        borderColor: "error.200",
+                        borderRadius: 1,
+                        maxHeight: 200,
+                        overflow: "auto",
+                      }}
+                    >
+                      <Typography
+                        variant="body2"
+                        color="error"
+                        sx={{ fontFamily: "monospace", fontSize: "0.875rem" }}
+                      >
+                        {selectedJob.error_message}
+                      </Typography>
+                    </Paper>
+                  </Box>
+                )}
+
+                {/* Logs Section */}
+                {selectedJob.logs && selectedJob.logs.length > 0 && (
+                  <Box sx={{ mb: 4 }}>
+                    <Typography variant="subtitle2" gutterBottom>
+                      Job Logs
+                    </Typography>
+                    <Paper
+                      sx={{
+                        p: 2,
+                        bgcolor: "grey.50",
+                        border: "1px solid",
+                        borderColor: "divider",
+                        borderRadius: 1,
+                        maxHeight: 300,
+                        overflow: "auto",
+                      }}
+                    >
+                      {selectedJob.logs.map((log, index) => (
+                        <Box
+                          key={index}
+                          sx={{
+                            mb: 1,
+                            pb: 1,
+                            borderBottom:
+                              index < (selectedJob.logs?.length || 0) - 1
+                                ? "1px solid #e5e7eb"
+                                : "none",
+                          }}
+                        >
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            display="block"
+                          >
+                            {new Date(log.timestamp).toLocaleString()}
+                          </Typography>
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              fontFamily: "monospace",
+                              fontSize: "0.875rem",
+                            }}
+                          >
+                            {log.message}
+                          </Typography>
+                        </Box>
+                      ))}
+                    </Paper>
+                  </Box>
+                )}
               </Box>
             ) : null}
           </DialogContent>
 
           <DialogActions sx={{ p: 3, pt: 0 }}>
+            <Box sx={{ display: "flex", gap: 1, flex: 1 }}>
+              {selectedJob && canRetryJob(selectedJob.status) && (
+                <Button
+                  variant="contained"
+                  color="primary"
+                  onClick={() => {
+                    handleRetryJob(selectedJob.job_id);
+                    setDetailsOpen(false);
+                  }}
+                  disabled={actionLoading === selectedJob.job_id}
+                  startIcon={
+                    actionLoading === selectedJob.job_id ? (
+                      <CircularProgress size={16} />
+                    ) : (
+                      <RetryIcon />
+                    )
+                  }
+                >
+                  Retry Job
+                </Button>
+              )}
+
+              {selectedJob && canCancelJob(selectedJob.status) && (
+                <Button
+                  variant="contained"
+                  color="error"
+                  onClick={() => {
+                    handleCancelJob(selectedJob.job_id);
+                    setDetailsOpen(false);
+                  }}
+                  disabled={actionLoading === selectedJob.job_id}
+                  startIcon={
+                    actionLoading === selectedJob.job_id ? (
+                      <CircularProgress size={16} />
+                    ) : (
+                      <CancelIcon />
+                    )
+                  }
+                >
+                  Cancel Job
+                </Button>
+              )}
+            </Box>
+
             <Button
               variant="outlined"
               onClick={() => setDetailsOpen(false)}

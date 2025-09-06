@@ -19,6 +19,18 @@ except ImportError:
     # Handle case where transform_utils is not available
     flatten_json = csv_to_json = filter_records = aggregate = None
 
+# Import logic utilities for advanced transformations
+try:
+    from logic_utils import (
+        map_records, 
+        conditional, 
+        create_condition_function, 
+        create_transform_function
+    )
+except ImportError:
+    # Handle case where logic_utils is not available
+    map_records = conditional = create_condition_function = create_transform_function = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,10 +82,16 @@ async def handle_http_call(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 async def handle_data_transform(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Handle data transformation tasks using transform_utils.
+    Handle data transformation tasks using transform_utils and logic_utils.
+    
+    Supports both single operations and sequential transformations.
     
     Args:
-        payload: Job payload containing transformation parameters
+        payload: Job payload containing transformation parameters.
+                Can contain:
+                - 'operation': Single operation to perform
+                - 'transformations': List of operations to perform sequentially
+                - 'records': Data to transform (for sequential operations)
         
     Returns:
         Dictionary with transformation result
@@ -86,88 +104,266 @@ async def handle_data_transform(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not all([flatten_json, csv_to_json, filter_records, aggregate]):
         raise TaskHandlerError("Transform utilities not available")
     
-    operation = payload.get('operation')
-    if not operation:
-        raise TaskHandlerError("Missing 'operation' in payload")
+    if not all([map_records, conditional, create_condition_function, create_transform_function]):
+        raise TaskHandlerError("Logic utilities not available")
     
     try:
-        if operation == 'flatten_json':
-            data = payload.get('data', {})
-            if not isinstance(data, dict):
-                raise TaskHandlerError("Data must be a dictionary for flatten_json operation")
-            
-            result = flatten_json(data)
-            return {
-                'status': 'success',
-                'operation': 'flatten_json',
-                'result': result,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
+        # Check if this is a sequential transformation
+        transformations = payload.get('transformations')
+        if transformations:
+            return await _handle_sequential_transformations(payload)
         
-        elif operation == 'csv_to_json':
-            csv_content = payload.get('csv_content', '')
-            delimiter = payload.get('delimiter', ',')
-            
-            if not csv_content:
-                raise TaskHandlerError("Missing 'csv_content' in payload")
-            
-            result = csv_to_json(csv_content, delimiter)
-            return {
-                'status': 'success',
-                'operation': 'csv_to_json',
-                'result': result,
-                'record_count': len(result),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
+        # Handle single operation (backward compatibility)
+        operation = payload.get('operation')
+        if not operation:
+            raise TaskHandlerError("Missing 'operation' in payload")
         
-        elif operation == 'filter_records':
-            records = payload.get('records', [])
-            criteria = payload.get('criteria', {})
-            
-            if not records:
-                raise TaskHandlerError("Missing 'records' in payload")
-            if not criteria:
-                raise TaskHandlerError("Missing 'criteria' in payload")
-            
-            result = filter_records(records, **criteria)
-            return {
-                'status': 'success',
-                'operation': 'filter_records',
-                'result': result,
-                'filtered_count': len(result),
-                'original_count': len(records),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-        
-        elif operation == 'aggregate':
-            records = payload.get('records', [])
-            field = payload.get('field', '')
-            agg_type = payload.get('agg_type', 'sum')
-            
-            if not records:
-                raise TaskHandlerError("Missing 'records' in payload")
-            if not field:
-                raise TaskHandlerError("Missing 'field' in payload")
-            
-            result = aggregate(records, field, agg_type)
-            return {
-                'status': 'success',
-                'operation': 'aggregate',
-                'field': field,
-                'agg_type': agg_type,
-                'result': result,
-                'record_count': len(records),
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-        
-        else:
-            raise TaskHandlerError(f"Unknown operation: {operation}")
+        return await _handle_single_operation(operation, payload)
     
     except Exception as e:
         if isinstance(e, TaskHandlerError):
             raise
         else:
-            raise TaskHandlerError(f"Data transformation failed: {str(e)}")
+            raise TaskHandlerError(f"Error in data transformation: {e}")
+
+
+async def _handle_sequential_transformations(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle sequential transformations on a list of records.
+    
+    Args:
+        payload: Job payload containing 'transformations' list and 'records'
+        
+    Returns:
+        Dictionary with transformation results
+    """
+    transformations = payload.get('transformations', [])
+    records = payload.get('records', [])
+    
+    if not transformations:
+        raise TaskHandlerError("Missing 'transformations' in payload")
+    
+    if not records:
+        raise TaskHandlerError("Missing 'records' in payload")
+    
+    if not isinstance(records, list):
+        raise TaskHandlerError("Records must be a list for sequential transformations")
+    
+    if not isinstance(transformations, list):
+        raise TaskHandlerError("Transformations must be a list")
+    
+    logger.info(f"Processing {len(transformations)} sequential transformations on {len(records)} records")
+    
+    current_records = records.copy()
+    transformation_results = []
+    
+    for i, transform_spec in enumerate(transformations):
+        logger.info(f"Executing transformation {i + 1}/{len(transformations)}: {transform_spec.get('type', 'unknown')}")
+        
+        try:
+            result = await _execute_single_transformation(transform_spec, current_records)
+            current_records = result.get('records', current_records)
+            transformation_results.append({
+                'step': i + 1,
+                'transformation': transform_spec,
+                'result': result,
+                'record_count': len(current_records)
+            })
+        except Exception as e:
+            logger.error(f"Error in transformation step {i + 1}: {e}")
+            raise TaskHandlerError(f"Error in transformation step {i + 1}: {e}")
+    
+    return {
+        'status': 'success',
+        'operation': 'sequential_transformations',
+        'transformations_applied': len(transformations),
+        'initial_record_count': len(records),
+        'final_record_count': len(current_records),
+        'transformation_results': transformation_results,
+        'final_records': current_records,
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+
+
+async def _execute_single_transformation(transform_spec: Dict[str, Any], records: list) -> Dict[str, Any]:
+    """
+    Execute a single transformation step.
+    
+    Args:
+        transform_spec: Transformation specification
+        records: Current records to transform
+        
+    Returns:
+        Dictionary with transformation result
+    """
+    transform_type = transform_spec.get('type')
+    
+    if transform_type == 'map':
+        # Apply a function to each record
+        func_spec = transform_spec.get('function')
+        if not func_spec:
+            raise TaskHandlerError("Map transformation requires 'function' specification")
+        
+        # Create the transformation function
+        if isinstance(func_spec, dict):
+            transform_func = create_transform_function(func_spec)
+        else:
+            raise TaskHandlerError("Function specification must be a dictionary")
+        
+        # Apply the function to all records
+        transformed_records = map_records(records, transform_func)
+        
+        return {
+            'type': 'map',
+            'records': transformed_records,
+            'transformed_count': len(transformed_records)
+        }
+    
+    elif transform_type == 'conditional':
+        # Apply conditional logic to each record
+        condition_spec = transform_spec.get('condition')
+        if_func_spec = transform_spec.get('if_function')
+        else_func_spec = transform_spec.get('else_function')
+        
+        if not all([condition_spec, if_func_spec, else_func_spec]):
+            raise TaskHandlerError("Conditional transformation requires 'condition', 'if_function', and 'else_function'")
+        
+        # Create the functions
+        condition_func = create_condition_function(condition_spec)
+        if_func = create_transform_function(if_func_spec)
+        else_func = create_transform_function(else_func_spec)
+        
+        # Apply conditional logic to all records
+        transformed_records = []
+        for record in records:
+            transformed_record = conditional(record, condition_func, if_func, else_func)
+            transformed_records.append(transformed_record)
+        
+        return {
+            'type': 'conditional',
+            'records': transformed_records,
+            'transformed_count': len(transformed_records)
+        }
+    
+    elif transform_type == 'filter':
+        # Filter records based on criteria
+        criteria = transform_spec.get('criteria', {})
+        if not criteria:
+            raise TaskHandlerError("Filter transformation requires 'criteria'")
+        
+        filtered_records = filter_records(records, **criteria)
+        
+        return {
+            'type': 'filter',
+            'records': filtered_records,
+            'filtered_count': len(filtered_records),
+            'original_count': len(records)
+        }
+    
+    elif transform_type == 'aggregate':
+        # Aggregate records
+        field = transform_spec.get('field')
+        agg_type = transform_spec.get('agg_type', 'sum')
+        
+        if not field:
+            raise TaskHandlerError("Aggregate transformation requires 'field'")
+        
+        result = aggregate(records, field, agg_type)
+        
+        return {
+            'type': 'aggregate',
+            'field': field,
+            'agg_type': agg_type,
+            'result': result,
+            'record_count': len(records)
+        }
+    
+    else:
+        raise TaskHandlerError(f"Unknown transformation type: {transform_type}")
+
+
+async def _handle_single_operation(operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle a single transformation operation (backward compatibility).
+    
+    Args:
+        operation: Operation type
+        payload: Operation payload
+        
+    Returns:
+        Dictionary with operation result
+    """
+    if operation == 'flatten_json':
+        data = payload.get('data', {})
+        if not isinstance(data, dict):
+            raise TaskHandlerError("Data must be a dictionary for flatten_json operation")
+        
+        result = flatten_json(data)
+        return {
+            'status': 'success',
+            'operation': 'flatten_json',
+            'result': result,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    elif operation == 'csv_to_json':
+        csv_content = payload.get('csv_content', '')
+        delimiter = payload.get('delimiter', ',')
+        
+        if not csv_content:
+            raise TaskHandlerError("Missing 'csv_content' in payload")
+        
+        result = csv_to_json(csv_content, delimiter)
+        return {
+            'status': 'success',
+            'operation': 'csv_to_json',
+            'result': result,
+            'record_count': len(result),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    elif operation == 'filter_records':
+        records = payload.get('records', [])
+        criteria = payload.get('criteria', {})
+        
+        if not records:
+            raise TaskHandlerError("Missing 'records' in payload")
+        if not criteria:
+            raise TaskHandlerError("Missing 'criteria' in payload")
+        
+        result = filter_records(records, **criteria)
+        return {
+            'status': 'success',
+            'operation': 'filter_records',
+            'result': result,
+            'filtered_count': len(result),
+            'original_count': len(records),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    elif operation == 'aggregate':
+        records = payload.get('records', [])
+        field = payload.get('field', '')
+        agg_type = payload.get('agg_type', 'sum')
+        
+        if not records:
+            raise TaskHandlerError("Missing 'records' in payload")
+        if not field:
+            raise TaskHandlerError("Missing 'field' in payload")
+        
+        result = aggregate(records, field, agg_type)
+        return {
+            'status': 'success',
+            'operation': 'aggregate',
+            'field': field,
+            'agg_type': agg_type,
+            'result': result,
+            'record_count': len(records),
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+    
+    else:
+        raise TaskHandlerError(f"Unknown operation: {operation}")
 
 
 async def handle_email_send(payload: Dict[str, Any]) -> Dict[str, Any]:

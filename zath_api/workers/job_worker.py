@@ -27,6 +27,10 @@ from config.redis import get_redis_client, test_redis_connection
 from db.connection import get_pool, init_db_pool
 from workers.task_handlers import execute_task
 from workers.dead_letter_queue import add_to_dead_letter_queue
+from utils.job_logger import (
+    get_job_logger, log_job_started, log_job_completed, log_job_failed,
+    log_job_retry, log_job_cancelled, log_worker_event, log_callback_failed, shutdown_job_logger
+)
 
 # Configure logging
 logging.basicConfig(
@@ -120,33 +124,76 @@ class JobWorker:
         task_type = job_data["task_type"]
         payload = job_data["payload"]
         callback_url = job_data.get("callback_url")
+        start_time = datetime.now(timezone.utc)
         
         logger.info(f"Processing job {job_id} of type {task_type}")
+        
+        # Debug logging for payload type
+        logger.debug(f"Job {job_id} payload type: {type(payload)}, payload: {payload}")
+        
+        # Ensure payload is a dictionary
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+                logger.info(f"Job {job_id} payload was string, parsed to dict: {payload}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Job {job_id} payload is invalid JSON string: {payload}, error: {e}")
+                await log_job_failed(job_id, f"Invalid payload format: {str(e)}", retry_count=0, max_retries=3)
+                return False
+        
+        # Log job start
+        await log_job_started(job_id, task_type, payload)
+        await log_worker_event(job_id, "job_processing_started", {
+            "task_type": task_type,
+            "has_callback": bool(callback_url),
+            "payload_keys": list(payload.keys()) if payload and isinstance(payload, dict) else []
+        })
         
         try:
             # Update job status to in_progress
             await self._update_job_status(job_id, "in_progress")
+            await log_worker_event(job_id, "status_updated", {"status": "in_progress"})
             
             # Execute the task using the appropriate handler
-            success, result, error_message = await execute_task(task_type, payload)
+            try:
+                success, result, error_message = await execute_task(task_type, payload)
+            except Exception as e:
+                logger.error(f"Job {job_id} task execution failed with exception: {str(e)}")
+                await log_job_failed(job_id, f"Task execution exception: {str(e)}", retry_count=0, max_retries=3)
+                return False
             
             if success:
+                # Calculate processing duration
+                duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+                
                 # Update job status to completed
                 await self._update_job_status(job_id, "completed")
+                await log_worker_event(job_id, "status_updated", {"status": "completed"})
+                
+                # Log job completion
+                await log_job_completed(job_id, result, duration)
                 
                 # Send callback if URL provided
                 if callback_url:
-                    callback_success = await self._send_callback(callback_url, job_id, "completed", result=result)
+                    await log_worker_event(job_id, "callback_started", {"callback_url": callback_url})
+                    callback_success, callback_error = await self._send_callback(callback_url, job_id, "completed", result=result)
                     if not callback_success:
                         logger.warning(f"Job {job_id} completed but callback failed after all retries")
+                        await log_callback_failed(job_id, callback_url, callback_error, 
+                                                retry_count=3, max_retries=3)
+                        # Update job status to callback_failed
+                        await self._update_job_status(job_id, "callback_failed")
+                        await log_worker_event(job_id, "status_updated", {"status": "callback_failed"})
                     else:
                         logger.info(f"Job {job_id} completed and callback sent successfully")
+                        await log_worker_event(job_id, "callback_success", {"callback_url": callback_url})
                 
                 logger.info(f"Job {job_id} completed successfully")
                 return True
             else:
                 # Task execution failed - send to dead letter queue
                 logger.error(f"Job {job_id} failed: {error_message}")
+                await log_job_failed(job_id, error_message, retry_count=0, max_retries=3)
                 
                 try:
                     # Add to dead letter queue
@@ -158,29 +205,40 @@ class JobWorker:
                         retry_count=0,
                         max_retries=3
                     )
+                    await log_worker_event(job_id, "moved_to_dead_letter_queue", {
+                        "error_message": error_message,
+                        "retry_count": 0
+                    })
                     
                     # Update job status to failed
                     await self._update_job_status(job_id, "failed")
+                    await log_worker_event(job_id, "status_updated", {"status": "failed"})
                     
                     # Send failure callback if URL provided
                     if callback_url:
-                        callback_success = await self._send_callback(callback_url, job_id, "failed", error=error_message)
+                        await log_worker_event(job_id, "failure_callback_started", {"callback_url": callback_url})
+                        callback_success, callback_error = await self._send_callback(callback_url, job_id, "failed", error=error_message)
                         if not callback_success:
                             logger.warning(f"Job {job_id} failed and callback also failed after all retries")
+                            await log_callback_failed(job_id, callback_url, callback_error, 
+                                                    retry_count=3, max_retries=3)
                         else:
                             logger.info(f"Job {job_id} failed but callback sent successfully")
+                            await log_worker_event(job_id, "failure_callback_success", {"callback_url": callback_url})
                     
                     logger.info(f"Job {job_id} moved to dead letter queue")
                     return False
                     
                 except Exception as dlq_error:
                     logger.error(f"Failed to add job {job_id} to dead letter queue: {str(dlq_error)}")
+                    await log_worker_event(job_id, "dead_letter_queue_error", {"error": str(dlq_error)})
                     # Still update job status to failed
                     await self._update_job_status(job_id, "failed")
                     return False
             
         except Exception as e:
             logger.error(f"Job {job_id} failed with unexpected error: {str(e)}")
+            await log_job_failed(job_id, f"Unexpected error: {str(e)}", retry_count=0, max_retries=3)
             
             try:
                 # Add to dead letter queue for unexpected errors
@@ -192,23 +250,34 @@ class JobWorker:
                     retry_count=0,
                     max_retries=3
                 )
+                await log_worker_event(job_id, "moved_to_dead_letter_queue", {
+                    "error_message": f"Unexpected error: {str(e)}",
+                    "retry_count": 0,
+                    "error_type": "unexpected"
+                })
                 
                 # Update job status to failed
                 await self._update_job_status(job_id, "failed")
+                await log_worker_event(job_id, "status_updated", {"status": "failed"})
                 
                 # Send failure callback if URL provided
                 if callback_url:
-                    callback_success = await self._send_callback(callback_url, job_id, "failed", error=str(e))
+                    await log_worker_event(job_id, "failure_callback_started", {"callback_url": callback_url})
+                    callback_success, callback_error = await self._send_callback(callback_url, job_id, "failed", error=str(e))
                     if not callback_success:
                         logger.warning(f"Job {job_id} failed and callback also failed after all retries")
+                        await log_callback_failed(job_id, callback_url, callback_error, 
+                                                retry_count=3, max_retries=3)
                     else:
                         logger.info(f"Job {job_id} failed but callback sent successfully")
+                        await log_worker_event(job_id, "failure_callback_success", {"callback_url": callback_url})
                 
                 logger.info(f"Job {job_id} moved to dead letter queue due to unexpected error")
                 return False
                 
             except Exception as update_error:
                 logger.error(f"Failed to update job {job_id} status: {str(update_error)}")
+                await log_worker_event(job_id, "status_update_error", {"error": str(update_error)})
                 return False
     
     async def _update_job_status(self, job_id: str, status: str):
@@ -310,7 +379,7 @@ class JobWorker:
                         logger.info(f"Callback sent successfully to {callback_url}, status: {response.status}")
                         # Update retry count to 0 on success
                         await self._update_callback_retry_count(job_id, 0)
-                        return True
+                        return True, None
                     else:
                         error_msg = f"HTTP {response.status} response from {callback_url}"
                         logger.warning(f"Callback attempt {attempt + 1} failed: {error_msg}")
@@ -322,7 +391,7 @@ class JobWorker:
                         else:
                             logger.error(f"All callback attempts failed for job {job_id}. Final error: {error_msg}")
                             await self._update_callback_retry_count(job_id, max_retries + 1)
-                            return False
+                            return False, error_msg
                             
             except Exception as e:
                 error_msg = f"Connection error: {str(e)}"
@@ -335,9 +404,9 @@ class JobWorker:
                 else:
                     logger.error(f"All callback attempts failed for job {job_id}. Final error: {error_msg}")
                     await self._update_callback_retry_count(job_id, max_retries + 1)
-                    return False
+                    return False, error_msg
         
-        return False
+        return False, "Unknown error"
     
     async def _process_queue(self):
         """Main queue processing loop."""
@@ -371,6 +440,14 @@ class JobWorker:
             logger.error("Failed to initialize connections, worker cannot start")
             return
         
+        # Initialize job logger
+        try:
+            job_logger = await get_job_logger()
+            logger.info("Job logger initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize job logger: {str(e)}")
+            # Continue without logging - don't fail the worker
+        
         self.running = True
         logger.info("Job worker started successfully")
         
@@ -385,6 +462,13 @@ class JobWorker:
         """Stop the job worker gracefully."""
         logger.info("Stopping job worker...")
         self.running = False
+        
+        # Shutdown job logger
+        try:
+            await shutdown_job_logger()
+            logger.info("Job logger shutdown completed")
+        except Exception as e:
+            logger.error(f"Error shutting down job logger: {str(e)}")
         
         # Cleanup connections
         await self._cleanup_connections()

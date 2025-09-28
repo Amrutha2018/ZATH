@@ -13,23 +13,15 @@ from typing import Dict, Any, Optional, Tuple
 from datetime import datetime, timezone
 
 # Import transform utilities for data_transform tasks
-try:
-    from transform_utils import flatten_json, csv_to_json, filter_records, aggregate
-except ImportError:
-    # Handle case where transform_utils is not available
-    flatten_json = csv_to_json = filter_records = aggregate = None
+from transform_utils import flatten_json, csv_to_json, filter_records, aggregate
 
 # Import logic utilities for advanced transformations
-try:
-    from logic_utils import (
+from logic_utils import (
         map_records, 
         conditional, 
         create_condition_function, 
         create_transform_function
     )
-except ImportError:
-    # Handle case where logic_utils is not available
-    map_records = conditional = create_condition_function = create_transform_function = None
 
 logger = logging.getLogger(__name__)
 

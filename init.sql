@@ -21,10 +21,20 @@ COMMENT ON COLUMN jobs.task_type IS 'Type of job task: http_call (default), data
 -- job_logs table
 CREATE TABLE job_logs (
     id SERIAL PRIMARY KEY,
-    job_id UUID REFERENCES jobs(id),
-    log TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    log_level VARCHAR(10) NOT NULL DEFAULT 'INFO',
+    message TEXT NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT valid_log_level CHECK (log_level IN ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'))
 );
+
+-- Create indexes for better query performance
+CREATE INDEX idx_job_logs_job_id ON job_logs(job_id);
+CREATE INDEX idx_job_logs_timestamp ON job_logs(timestamp);
+CREATE INDEX idx_job_logs_log_level ON job_logs(log_level);
+
+-- Add comment to document the log levels
+COMMENT ON COLUMN job_logs.log_level IS 'Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL';
 
 -- Note: Dead letter queue is implemented using Redis, not a database table
 -- This allows for better performance and easier integration with the job processing system

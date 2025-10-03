@@ -1,0 +1,72 @@
+# Base Docker Compose configuration
+# Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Or: docker compose -f docker-compose.yml -f docker-compose.prod.yml up
+
+services:
+  redis:
+    image: redis:7
+    container_name: zath-redis
+    ports:
+      - "6380:6379"
+    restart: always
+
+  postgres:
+    image: postgres:15
+    container_name: zath-postgres
+    environment:
+      POSTGRES_DB: zathdb
+      POSTGRES_USER: zathuser
+      POSTGRES_PASSWORD: zathpass
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: always
+
+  zathapi:
+    build:
+      context: ./zath_api
+    container_name: zath-api
+    ports:
+      - "8001:8000"
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./zath_api:/app
+    env_file:
+      - .env
+    restart: always
+
+  worker:
+    build:
+      context: ./zath_api
+    container_name: zath-worker
+    command: ["python", "workers/run_worker.py"]
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./zath_api:/app
+    env_file:
+      - .env
+    restart: always
+
+  zathfrontend:
+    build:
+      context: ./zath_frontend
+    container_name: zath-frontend
+    ports:
+      - "3001:3000"
+    depends_on:
+      - zathapi
+    volumes:
+      - ./zath_frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+    restart: always
+
+volumes:
+  postgres_data:
